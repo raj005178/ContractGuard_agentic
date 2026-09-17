@@ -3,7 +3,6 @@
 Provides email-based signup/signin and anonymous guest login.
 User credentials are stored in MongoDB with bcrypt-hashed passwords.
 """
-
 from __future__ import annotations
 
 import logging
