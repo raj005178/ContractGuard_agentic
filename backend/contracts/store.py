@@ -1,0 +1,350 @@
+"""MongoDB asynchronous storage primitives for ContractGuard."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from motor.motor_asyncio import AsyncIOMotorClient
+
+logger = logging.getLogger("contractguard.store")
+
+
+try:
+    import certifi
+    _CA_FILE = certifi.where()
+except Exception:
+    _CA_FILE = None
+
+
+class MongoContractStore:
+    """MongoDB store for contract text, chunks, embeddings, summaries, and chat history."""
+
+    def __init__(self, uri: str, db_name: str):
+        self.uri = uri
+        self.db_name = db_name
+        self._client = None
+        self._db = None
+        self.is_available: bool = True
+
+    @property
+    def db(self):
+        if self._client is None:
+            from motor.motor_asyncio import AsyncIOMotorClient
+            kwargs: dict[str, Any] = {
+                "serverSelectionTimeoutMS": 2000,
+                "connectTimeoutMS": 2000,
+                "socketTimeoutMS": 5000,
+            }
+            if _CA_FILE:
+                kwargs["tlsCAFile"] = _CA_FILE
+            self._client = AsyncIOMotorClient(self.uri, **kwargs)
+            self._db = self._client[self.db_name]
+        return self._db
+
+    def close(self) -> None:
+        """Close the database client and reset connection state."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+            self._db = None
+
+    @property
+    def contracts(self): return self.db.contracts
+    @property
+    def summaries(self): return self.db.summaries
+    @property
+    def risks(self): return self.db.risks
+    @property
+    def chat_history(self): return self.db.chat_history
+    @property
+    def metadata(self): return self.db.metadata
+    @property
+    def vendor_verifications(self): return self.db.vendor_verifications
+
+    async def clear_all(self) -> None:
+        """Clear the entire database for a new session."""
+        if not self.is_available:
+            return
+        try:
+            await self.contracts.drop()
+            await self.summaries.drop()
+            await self.risks.drop()
+            await self.chat_history.drop()
+            await self.metadata.drop()
+            await self.vendor_verifications.drop()
+        except Exception as exc:
+            logger.warning("MongoDB clear_all failed: %s", exc)
+            self.is_available = False
+
+    async def delete_contract(self, contract_id: str) -> None:
+        """Delete a single contract and all associated data."""
+        if not self.is_available:
+            return
+        try:
+            await self.contracts.delete_one({"_id": contract_id})
+            await self.summaries.delete_one({"_id": contract_id})
+            await self.risks.delete_one({"_id": contract_id})
+            await self.chat_history.delete_many({"contract_id": contract_id})
+            await self.metadata.delete_one({"_id": contract_id})
+            await self.vendor_verifications.delete_one({"_id": contract_id})
+        except Exception as exc:
+            logger.warning("MongoDB delete_contract failed: %s", exc)
+            self.is_available = False
+
+    async def save_contract(self, contract_id: str, title: str, text: str) -> None:
+        """Save basic contract text info without vector data."""
+        if not self.is_available:
+            return
+        try:
+            await self.contracts.update_one(
+                {"_id": contract_id},
+                {
+                    "$set": {
+                        "title": title, 
+                        "text": text,
+                        "uploaded_at": datetime.now(timezone.utc).isoformat()
+                    }
+                },
+                upsert=True
+            )
+        except Exception as exc:
+            logger.warning("MongoDB save_contract failed: %s", exc)
+            self.is_available = False
+
+    async def save_contract_chunks_and_embeddings(
+        self,
+        contract_id: str,
+        chunks: List[str],
+        embeddings: List[List[float]],
+        dimension: int
+    ) -> None:
+        """Save chunk components to avoid re-embedding."""
+        if not self.is_available:
+            return
+        try:
+            await self.contracts.update_one(
+                {"_id": contract_id},
+                {
+                    "$set": {
+                        "chunks": chunks,
+                        "embeddings": embeddings,
+                        "dimension": dimension
+                    }
+                },
+                upsert=True
+            )
+        except Exception as exc:
+            logger.warning("MongoDB save_contract_chunks failed: %s", exc)
+            self.is_available = False
+
+    async def get_text(self, contract_id: str) -> str | None:
+        if not self.is_available:
+            return None
+        try:
+            doc = await self.contracts.find_one({"_id": contract_id}, {"text": 1})
+            return doc.get("text") if doc else None
+        except Exception as exc:
+            logger.warning("MongoDB get_text failed: %s", exc)
+            self.is_available = False
+            return None
+
+    async def get_contract_data(self, contract_id: str) -> Dict[str, Any] | None:
+        """Returns the full contract document including chunks and embeddings if present."""
+        if not self.is_available:
+            return None
+        try:
+            return await self.contracts.find_one({"_id": contract_id})
+        except Exception as exc:
+            logger.warning("MongoDB get_contract_data failed: %s", exc)
+            self.is_available = False
+            return None
+
+    async def set_summary(self, contract_id: str, max_chars: int, summary: str) -> None:
+        if not self.is_available:
+            return
+        try:
+            await self.summaries.update_one(
+                {"contract_id": contract_id, "max_chars": max_chars},
+                {"$set": {"summary": summary}},
+                upsert=True
+            )
+        except Exception as exc:
+            logger.warning("MongoDB set_summary failed: %s", exc)
+            self.is_available = False
+
+    async def get_summary(self, contract_id: str, max_chars: int) -> str | None:
+        if not self.is_available:
+            return None
+        try:
+            doc = await self.summaries.find_one({"contract_id": contract_id, "max_chars": max_chars})
+            return doc.get("summary") if doc else None
+        except Exception as exc:
+            logger.warning("MongoDB get_summary failed: %s", exc)
+            self.is_available = False
+            return None
+
+    async def set_risks(self, contract_id: str, risk_data: dict) -> None:
+        if not self.is_available:
+            return
+        try:
+            await self.risks.update_one(
+                {"_id": contract_id},
+                {"$set": {"data": risk_data}},
+                upsert=True
+            )
+        except Exception as exc:
+            logger.warning("MongoDB set_risks failed: %s", exc)
+            self.is_available = False
+
+    async def get_risks(self, contract_id: str) -> dict | None:
+        if not self.is_available:
+            return None
+        try:
+            doc = await self.risks.find_one({"_id": contract_id})
+            return doc.get("data") if doc else None
+        except Exception as exc:
+            logger.warning("MongoDB get_risks failed: %s", exc)
+            self.is_available = False
+            return None
+        
+    # ── Session-aware chat history ──────────────────────────────────
+
+    async def append_chat_interaction(
+        self,
+        contract_id: str,
+        question: str,
+        answer: str,
+        session_id: str = "",
+    ) -> None:
+        """Append a Q&A turn, scoped by (contract_id, session_id)."""
+        if not self.is_available:
+            return
+        try:
+            key = {"contract_id": contract_id, "session_id": session_id}
+            await self.chat_history.update_one(
+                key,
+                {
+                    "$push": {
+                        "interactions": {
+                            "question": question,
+                            "answer": answer,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                    }
+                },
+                upsert=True,
+            )
+        except Exception as exc:
+            logger.warning("MongoDB append_chat failed: %s", exc)
+            self.is_available = False
+
+    async def get_chat_history(
+        self,
+        contract_id: str,
+        session_id: str = "",
+    ) -> List[dict]:
+        """Retrieve chat history for a specific (contract_id, session_id)."""
+        if not self.is_available:
+            return []
+        try:
+            key = {"contract_id": contract_id, "session_id": session_id}
+            doc = await self.chat_history.find_one(key)
+            return doc.get("interactions", []) if doc else []
+        except Exception as exc:
+            logger.warning("MongoDB get_chat_history failed: %s", exc)
+            self.is_available = False
+            return []
+
+    async def clear_chat_session(
+        self,
+        contract_id: str,
+        session_id: str = "",
+    ) -> None:
+        """Clear chat history for a specific (contract_id, session_id)."""
+        if not self.is_available:
+            return
+        try:
+            key = {"contract_id": contract_id, "session_id": session_id}
+            await self.chat_history.delete_one(key)
+        except Exception as exc:
+            logger.warning("MongoDB clear_chat failed: %s", exc)
+            self.is_available = False
+
+    # ── Metadata storage ─────────────────────────────────────────────
+
+    async def set_metadata(self, contract_id: str, metadata: dict) -> None:
+        """Cache extracted metadata for a contract."""
+        if not self.is_available:
+            return
+        try:
+            await self.metadata.update_one(
+                {"_id": contract_id},
+                {"$set": {"data": metadata}},
+                upsert=True,
+            )
+        except Exception as exc:
+            logger.warning("MongoDB set_metadata failed: %s", exc)
+            self.is_available = False
+
+    async def get_metadata(self, contract_id: str) -> dict | None:
+        """Retrieve cached metadata for a contract."""
+        if not self.is_available:
+            return None
+        try:
+            doc = await self.metadata.find_one({"_id": contract_id})
+            return doc.get("data") if doc else None
+        except Exception as exc:
+            logger.warning("MongoDB get_metadata failed: %s", exc)
+            self.is_available = False
+            return None
+
+    # ── Vendor verification storage ──────────────────────────────────
+
+    async def set_vendor_verification(self, contract_id: str, data: dict) -> None:
+        """Cache vendor verification result."""
+        if not self.is_available:
+            return
+        try:
+            await self.vendor_verifications.update_one(
+                {"_id": contract_id},
+                {"$set": {"data": data}},
+                upsert=True,
+            )
+        except Exception as exc:
+            logger.warning("MongoDB set_vendor_verification failed: %s", exc)
+            self.is_available = False
+
+    async def get_vendor_verification(self, contract_id: str) -> dict | None:
+        """Retrieve cached vendor verification."""
+        if not self.is_available:
+            return None
+        try:
+            doc = await self.vendor_verifications.find_one({"_id": contract_id})
+            return doc.get("data") if doc else None
+        except Exception as exc:
+            logger.warning("MongoDB get_vendor_verification failed: %s", exc)
+            self.is_available = False
+            return None
+
+    async def list_all_contracts(self) -> List[Dict[str, Any]]:
+        """List metadata for all contracts in the database."""
+        if not self.is_available:
+            return []
+        try:
+            cursor = self.contracts.find({}, {"title": 1, "uploaded_at": 1, "_id": 1}).sort("uploaded_at", -1)
+            contracts = []
+            async for doc in cursor:
+                contracts.append({
+                    "contract_id": doc["_id"],
+                    "title": doc.get("title", "Untitled"),
+                    "uploaded_at": doc.get("uploaded_at", "")
+                })
+            return contracts
+        except Exception as exc:
+            logger.warning("MongoDB list_all_contracts failed: %s", exc)
+            self.is_available = False
+            return []
+
+__all__ = ["MongoContractStore"]
+

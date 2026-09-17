@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic
+pypdf
+python-docx
+python-multipart
+google-genai
+python-dotenv
+motor
+httpx
+numpy
+passlib[bcrypt]
+bcrypt
+langgraph>=0.2.0
